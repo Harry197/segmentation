@@ -19,7 +19,6 @@ from torchmetrics import JaccardIndex
 from dataset import MyDataset
 from deeplabv3 import DeepLabv3Plus
 from utils import compute_supervised_loss
-from stream import ProgressStream, CustomError
 
 
 def clip_gradient(optimizer, grad_clip):
@@ -143,96 +142,86 @@ def dataloader(args, color_dict={}):
 
 
 def train(args):
-    try:
-        with open(args.classes_path) as json_file:
-            color_dict = json.load(json_file)
-        num_classes = len(color_dict)
+    with open(args.classes_path) as json_file:
+        color_dict = json.load(json_file)
+    num_classes = len(color_dict)
 
-        train_loader, test_loader = dataloader(args, color_dict=color_dict)
+    train_loader, test_loader = dataloader(args, color_dict=color_dict)
 
-        if args.gpu:
-            device = torch.device(
-                "cuda:0" if torch.cuda.is_available() else "cpu")
-        else:
-            device = torch.device('cpu')
+    if args.gpu:
+        device = torch.device(
+            "cuda:0" if torch.cuda.is_available() else "cpu")
+    else:
+        device = torch.device('cpu')
 
-        model = DeepLabv3Plus(models.resnet50(
-            pretrained=True), num_classes=num_classes+1)
-        # if args.finetune_model:
-        #     model.load_state_dict(torch.load(model_path))
-        model.to(device)
+    model = DeepLabv3Plus(models.resnet50(
+        pretrained=True), num_classes=num_classes+1)
+    # if args.finetune_model:
+    #     model.load_state_dict(torch.load(model_path))
+    model.to(device)
 
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        scheduler = cosine_warmup(optimizer, args.epochs,  2)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    scheduler = cosine_warmup(optimizer, args.epochs,  2)
 
-        # Set up metrics
-        if num_classes == 1:
-            metrics = JaccardIndex(task='binary', num_classes=num_classes)
-        else:
-            metrics = JaccardIndex(task='multiclass', num_classes=num_classes)
+    # Set up metrics
+    if num_classes == 1:
+        metrics = JaccardIndex(task='binary', num_classes=num_classes)
+    else:
+        metrics = JaccardIndex(task='multiclass', num_classes=num_classes)
 
-        metrics.to(device)
-        best_iou = -1.0
-        print('Start Training')
-        for epoch in tqdm(range(args.epochs),
-                          file=ProgressStream(args.task_id)):
-            total_loss = []
-            print("Epoch {}/{}".format(epoch+1, args.epochs))
+    metrics.to(device)
+    best_iou = -1.0
+    print('Start Training')
+    for epoch in range(args.epochs):
+        total_loss = []
+        print("Epoch {}/{}".format(epoch+1, args.epochs))
 
-            for data in tqdm(train_loader):
+        for data in tqdm(train_loader):
+            images, labels = data[0].to(device), data[1].to(device)
+            optimizer.zero_grad()
+
+            preds = model(images)
+            preds = F.interpolate(preds, size=(
+                384, 384), mode='bilinear', align_corners=False)
+
+            loss = compute_supervised_loss(preds, labels)
+            total_loss.append(loss.item())
+            loss.backward()
+            clip_gradient(optimizer, 0.5)
+            optimizer.step()
+
+        print('Epoch: %d, Loss: %.3f' % (epoch+1, np.mean(total_loss)))
+
+        print("Eval")
+        model.eval()
+
+        iou = []
+        with torch.no_grad():
+            for data in test_loader:
                 images, labels = data[0].to(device), data[1].to(device)
-                optimizer.zero_grad()
-
                 preds = model(images)
                 preds = F.interpolate(preds, size=(
-                    384, 384), mode='bilinear', align_corners=False)
+                    384, 384), mode='bilinear', align_corners=True)
+                preds = torch.softmax(preds, dim=1)
+                preds = torch.argmax(preds, dim=1)
+                score = metrics(preds, labels)
+                iou.append(score.item())
 
-                loss = compute_supervised_loss(preds, labels)
-                total_loss.append(loss.item())
-                loss.backward()
-                clip_gradient(optimizer, 0.5)
-                optimizer.step()
-
-            print('Epoch: %d, Loss: %.3f' % (epoch+1, np.mean(total_loss)))
-
-            print("Eval")
-            model.eval()
-
-            iou = []
-            with torch.no_grad():
-                for data in test_loader:
-                    images, labels = data[0].to(device), data[1].to(device)
-                    preds = model(images)
-                    preds = F.interpolate(preds, size=(
-                        384, 384), mode='bilinear', align_corners=True)
-                    preds = torch.softmax(preds, dim=1)
-                    preds = torch.argmax(preds, dim=1)
-                    score = metrics(preds, labels)
-                    iou.append(score.item())
-
-            miou = np.mean(iou)
-            print('Epoch: %d, mIoU: %.3f' % (epoch+1, miou))
-            if miou > best_iou:
-                model_path = os.path.join(
-                    args.checkpoint_path,
-                    'model_epoch_{}_acc_{}.pth'.format(
-                        epoch+1,
-                        round(miou, 2)))
-                torch.save(model.state_dict(), model_path)
-                best_iou = miou
-                print('Saved new checkpoint')
-                with open('result.json', 'w') as json_file:
-                    json.dump({'iou': best_iou}, json_file)
-            model.train()
-            scheduler.step()
-    except Exception as e:
-        print(e)
-        custom_err = CustomError(args.task_id,
-                                 error_code="T02",
-                                 message="Error while training crop model")
-        custom_err.report()
-
-        raise e
+        miou = np.mean(iou)
+        print('Epoch: %d, mIoU: %.3f' % (epoch+1, miou))
+        if miou > best_iou:
+            model_path = os.path.join(
+                args.checkpoint_path,
+                'model_epoch_{}_acc_{}.pth'.format(
+                    epoch+1,
+                    round(miou, 2)))
+            torch.save(model.state_dict(), model_path)
+            best_iou = miou
+            print('Saved new checkpoint')
+            with open('result.json', 'w') as json_file:
+                json.dump({'iou': best_iou}, json_file)
+        model.train()
+        scheduler.step()
 
 
 if __name__ == "__main__":
